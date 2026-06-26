@@ -1,90 +1,127 @@
 /**
  * PCM AudioWorklet processor
  *
- * Capture path: mic (Float32 48kHz) → downsample 3x → Int16 16kHz → post 1920-byte frames
- * Playback path: receive Int16 16kHz frames → upsample 3x → Float32 48kHz output
+ * NOTE: This standalone file is LEGACY and is NOT loaded at runtime. The worklet that
+ * actually runs is inlined as `WORKLET_CODE` in composables/useCallAudio.ts (loaded via a
+ * Blob URL). This copy is kept in sync only to avoid confusion — edit the inline copy.
+ *
+ * The AudioContext runs at 16 kHz (the WhatsApp call rate), so the browser's native
+ * resampler handles mic 48k→16k and 16k→hardware. The worklet does NO manual resampling on
+ * the common path — only framing and a managed playback jitter buffer with prebuffering, a
+ * latency cap and click-free underrun concealment (PLC). If a browser ignores the 16 kHz
+ * request, a streaming linear resampler bridges the rates.
  */
+const TARGET_RATE = 16000;
+const FRAME = 960; // 60 ms @ 16 kHz
+
+// Streaming linear resampler — continuity preserved across blocks via fractional position.
+function makeResampler(inRate, outRate) {
+  let pos = 0;
+  const step = inRate / outRate;
+  return function (input) {
+    if (input.length === 0) return new Float32Array(0);
+    const out = [];
+    while (pos < input.length) {
+      const i = Math.floor(pos);
+      const frac = pos - i;
+      const a = input[i];
+      const b = input[i + 1 < input.length ? i + 1 : input.length - 1];
+      out.push(a + (b - a) * frac);
+      pos += step;
+    }
+    pos -= input.length;
+    return Float32Array.from(out);
+  };
+}
+
 class PcmProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    // Capture accumulator (Float32 16kHz samples)
-    this._capBuf = new Float32Array(0);
-    this._FRAME = 960; // 16kHz * 60ms
+    this._rate = sampleRate; // actual AudioContext rate
+    this._resample = Math.abs(this._rate - TARGET_RATE) > 1;
+    this._capRs = this._resample ? makeResampler(this._rate, TARGET_RATE) : null;  // mic → 16k
+    this._playRs = this._resample ? makeResampler(TARGET_RATE, this._rate) : null; // 16k → out
 
-    // Playback jitter buffer (Float32 48kHz)
-    this._playBuf = new Float32Array(0);
+    this._capBuf = new Float32Array(0);  // 16 kHz float capture accumulator
+    this._playBuf = new Float32Array(0); // context-rate float playback jitter buffer
+    this._started = false;               // prebuffer gate
+    this._lastVal = 0;                   // last output sample (click-free underrun)
+
+    this._prebuffer = Math.round(0.09 * this._rate); // ~90 ms before playback starts
+    this._targetFill = Math.round(0.15 * this._rate); // ~150 ms target after overrun trim
+    this._maxFill = Math.round(0.25 * this._rate);    // ~250 ms hard cap
 
     this.port.onmessage = (e) => {
       const raw = e.data;
       if (!raw) return;
-      // Accept ArrayBuffer or TypedArray
       const buf = raw instanceof ArrayBuffer ? raw : raw.buffer;
       const int16 = new Int16Array(buf);
-
-      // Upsample 16kHz → 48kHz: repeat each sample 3 times
-      const up = new Float32Array(int16.length * 3);
-      for (let i = 0; i < int16.length; i++) {
-        const s = int16[i] / 32768.0;
-        up[i * 3] = s;
-        up[i * 3 + 1] = s;
-        up[i * 3 + 2] = s;
-      }
-
-      // Append to playback buffer
-      const next = new Float32Array(this._playBuf.length + up.length);
+      let f = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) f[i] = int16[i] / 32768;
+      if (this._resample) f = this._playRs(f); // store in context-rate domain
+      const next = new Float32Array(this._playBuf.length + f.length);
       next.set(this._playBuf);
-      next.set(up, this._playBuf.length);
+      next.set(f, this._playBuf.length);
       this._playBuf = next;
+      if (this._playBuf.length > this._maxFill) {
+        this._playBuf = this._playBuf.slice(this._playBuf.length - this._targetFill);
+      }
     };
   }
 
   process(inputs, outputs) {
-    // ── Capture ─────────────────────────────────────────────────────────────
-    const inputChannel = inputs[0]?.[0];
-    if (inputChannel) {
-      // Downsample 48kHz → 16kHz: average 3-sample windows
-      const len = Math.floor(inputChannel.length / 3);
-      const down = new Float32Array(len);
-      for (let i = 0; i < len; i++) {
-        down[i] = (inputChannel[i * 3] + inputChannel[i * 3 + 1] + inputChannel[i * 3 + 2]) / 3;
-      }
-
-      // Append to capture accumulator
-      const combined = new Float32Array(this._capBuf.length + down.length);
-      combined.set(this._capBuf);
-      combined.set(down, this._capBuf.length);
-      this._capBuf = combined;
-
-      // Emit complete 60ms frames
-      while (this._capBuf.length >= this._FRAME) {
-        const frame = this._capBuf.slice(0, this._FRAME);
-        this._capBuf = this._capBuf.slice(this._FRAME);
-
-        const int16 = new Int16Array(this._FRAME);
-        for (let i = 0; i < this._FRAME; i++) {
-          const s = Math.max(-1, Math.min(1, frame[i]));
-          int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    // ── Capture: context rate → 16 kHz → 960-sample int16 frames ──
+    const input = inputs[0] && inputs[0][0];
+    if (input && input.length) {
+      const s = this._resample ? this._capRs(input) : input;
+      if (s.length) {
+        const merged = new Float32Array(this._capBuf.length + s.length);
+        merged.set(this._capBuf);
+        merged.set(s, this._capBuf.length);
+        this._capBuf = merged;
+        while (this._capBuf.length >= FRAME) {
+          const frame = this._capBuf.subarray(0, FRAME);
+          const int16 = new Int16Array(FRAME);
+          for (let i = 0; i < FRAME; i++) {
+            const x = frame[i] < -1 ? -1 : frame[i] > 1 ? 1 : frame[i];
+            int16[i] = x < 0 ? x * 0x8000 : x * 0x7fff;
+          }
+          this._capBuf = this._capBuf.slice(FRAME);
+          this.port.postMessage(int16.buffer, [int16.buffer]);
         }
-        // Transfer ownership to avoid copy
-        this.port.postMessage(int16.buffer, [int16.buffer]);
       }
     }
 
-    // ── Playback ─────────────────────────────────────────────────────────────
-    const out = outputs[0]?.[0];
+    // ── Playback: jitter buffer (context rate) → output ──
+    const out = outputs[0] && outputs[0][0];
     if (out) {
-      const take = Math.min(out.length, this._playBuf.length);
-      if (take > 0) {
-        out.set(this._playBuf.subarray(0, take));
-        this._playBuf = this._playBuf.slice(take);
+      if (!this._started) {
+        if (this._playBuf.length >= this._prebuffer) this._started = true;
+        else { out.fill(0); return true; }
       }
-      // Silence for remaining samples if buffer underruns
-      if (take < out.length) {
-        out.fill(0, take);
+      if (this._playBuf.length >= out.length) {
+        out.set(this._playBuf.subarray(0, out.length));
+        this._lastVal = out[out.length - 1];
+        this._playBuf = this._playBuf.slice(out.length);
+      } else {
+        // Underrun: conceal with a click-free ramp; keep _started so playback resumes
+        // seamlessly when frames arrive (no re-prebuffer latency on transient hiccups).
+        const have = this._playBuf.length;
+        if (have > 0) {
+          out.set(this._playBuf.subarray(0, have));
+          this._playBuf = new Float32Array(0);
+        }
+        this._rampToZero(out, have);
       }
     }
+    return true;
+  }
 
-    return true; // keep processor alive
+  _rampToZero(out, from) {
+    const start = from > 0 ? out[from - 1] : this._lastVal;
+    const rem = out.length - from;
+    for (let i = 0; i < rem; i++) out[from + i] = start * (1 - (i + 1) / rem);
+    this._lastVal = 0;
   }
 }
 
